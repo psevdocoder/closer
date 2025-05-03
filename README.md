@@ -8,66 +8,32 @@ Closer предоставляет возможность регистриров�
 package main
 
 import (
-	"context"
-	"errors"
+	"git.server.home/pkg/closer"
 	"log/slog"
-	"net/http"
-	"os/signal"
 	"syscall"
 	"time"
-
-	"git.server.home/pkg/closer"
 )
 
 const (
-	shutdownTimeout = 10 * time.Second
+	gracefulShutdownTimeout = time.Second * 10
 )
 
 func main() {
-	syscallCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	// Настраиваем сигналы и таймаут для глобального closer
+	closer.Init(
+		closer.WithSignals(syscall.SIGHUP, syscall.SIGINT),
+		closer.WithTimeout(gracefulShutdownTimeout),
+	)
 
-	srv := NewHttpServer()
-	srv.Start()
-
-	// Wait for syscall
-	<-syscallCtx.Done()
-	slog.Info("received syscall", slog.Any("signal", syscallCtx.Err()))
-
-	// Close resources with timeout
-	shutdownDeadlineCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-	if err := closer.Close(shutdownDeadlineCtx); err != nil {
-		slog.Error("failed to close resources", slog.Any("error", err))
-		return
-	}
-	slog.Info("app gracefully stopped")
-}
-
-type Srv struct {
-	*http.Server
-}
-
-func NewHttpServer() *Srv {
-	srv := http.Server{
-		Addr: ":8080",
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Write([]byte("Hello, World!"))
-		}),
-	}
-	return &Srv{&srv}
-}
-
-func (s *Srv) Start() {
-	go func() {
-		if err := s.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			panic(err)
-		}
-	}()
-
-	closer.Add(func(ctx context.Context) error {
-		return s.Shutdown(ctx)
+	closer.Add(func() error {
+		time.Sleep(time.Hour * 5)
+		slog.Info("done sleeping")
+		return nil
 	})
-}
 
+	// Запускаем основную логику приложения…
+
+	// Ждём graceful shutdown
+	closer.Wait()
+}
 ```

@@ -2,63 +2,102 @@ package closer
 
 import (
 	"context"
-	"fmt"
-	"strings"
+	"log/slog"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
+	"time"
 )
 
-var (
-	mu    sync.Mutex
-	funcs []Func
-)
-
-// Add добавляет функцию завершения в список.
-func Add(f Func) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	funcs = append(funcs, f)
+// Closer управляет graceful shutdown
+type Closer struct {
+	mu      sync.Mutex
+	once    sync.Once
+	done    chan struct{}
+	funcs   []func() error
+	signals []os.Signal
+	timeout time.Duration
 }
 
-// Close выполняет все зарегистрированные функции завершения.
-// Если выполнение завершено с ошибками, они возвращаются как одна ошибка.
-// В случае отмены контекста возвращается ошибка отмены.
-func Close(ctx context.Context) error {
-	mu.Lock()
-	defer mu.Unlock()
-
-	var (
-		msgs     = make([]string, 0, len(funcs))
-		complete = make(chan struct{}, 1)
-	)
-
+// New создаёт новый Closer и запускает слушатель сигналов.
+func New(opts ...Option) *Closer {
+	c := &Closer{
+		done:    make(chan struct{}),
+		signals: []os.Signal{syscall.SIGINT, syscall.SIGTERM},
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	// Запускаем слушатель ОС-сигналов
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, c.signals...)
 	go func() {
-		for _, f := range funcs {
-			if err := f(ctx); err != nil {
-				msgs = append(msgs, fmt.Sprintf("[!] %v", err))
+		if sig, ok := <-ch; ok {
+			slog.Info("Received shutdown signal", slog.String("signal", sig.String()))
+			c.CloseAll()
+		}
+	}()
+	return c
+}
+
+// Add метод экземпляра Closer
+func (c *Closer) Add(f ...func() error) {
+	c.mu.Lock()
+	c.funcs = append(c.funcs, f...)
+	c.mu.Unlock()
+}
+
+// Wait метод экземпляра Closer — альтернатива <-c.done
+func (c *Closer) Wait() {
+	<-c.done
+}
+
+// CloseAll запускает все функции ровно один раз.
+// После прихода сигнала начинается отсчёт таймаута (если он >0);
+// ждём завершения всех функций или истечения времени.
+func (c *Closer) CloseAll() {
+	c.once.Do(func() {
+		slog.Info("Graceful shutdown started")
+		defer close(c.done)
+
+		c.mu.Lock()
+		funcs := c.funcs
+		c.funcs = nil
+		c.mu.Unlock()
+
+		errCh := make(chan error, len(funcs))
+
+		// создаём контекст с таймаутом
+		var ctx context.Context
+		var cancel context.CancelFunc
+		if c.timeout > 0 {
+			ctx, cancel = context.WithTimeout(context.Background(), c.timeout)
+		} else {
+			ctx, cancel = context.WithCancel(context.Background())
+		}
+		defer cancel()
+
+		// запускаем все функции параллельно
+		for _, fn := range funcs {
+			go func(f func() error) {
+				errCh <- f()
+			}(fn)
+		}
+
+		// ждём их завершения или таймаута
+		for i := 0; i < cap(errCh); i++ {
+			select {
+			case err := <-errCh:
+				if err != nil {
+					slog.Error("Error in shutdown function", slog.Any("error", err))
+				}
+			case <-ctx.Done():
+				slog.Error("Graceful shutdown timed out", slog.Duration("timeout", c.timeout))
+				return
 			}
 		}
 
-		complete <- struct{}{}
-	}()
-
-	select {
-	case <-complete:
-		break
-	case <-ctx.Done():
-		return fmt.Errorf("shutdown cancelled: %v", ctx.Err())
-	}
-
-	if len(msgs) > 0 {
-		return fmt.Errorf(
-			"shutdown finished with error(s): \n%s",
-			strings.Join(msgs, "\n"),
-		)
-	}
-
-	return nil
+		slog.Info("Graceful shutdown completed successfully")
+	})
 }
-
-// Func представляет функцию завершения, которая принимает контекст
-// и возвращает ошибку в случае неудачного завершения.
-type Func func(ctx context.Context) error

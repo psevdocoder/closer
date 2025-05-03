@@ -2,6 +2,7 @@ package closer
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -12,24 +13,26 @@ import (
 
 // Closer управляет graceful shutdown
 type Closer struct {
-	mu      sync.Mutex
-	once    sync.Once
-	done    chan struct{}
-	funcs   []func() error
-	signals []os.Signal
-	timeout time.Duration
+	mu       sync.Mutex
+	once     sync.Once
+	done     chan struct{}
+	funcs    []func() error
+	signals  []os.Signal
+	timeout  time.Duration
+	execMode ExecutionMode
 }
 
-// New создаёт новый Closer и запускает слушатель сигналов.
+// New создаёт новый экземпляр Closer и запускает
+// обработку системных сигналов завершения
 func New(opts ...Option) *Closer {
 	c := &Closer{
-		done:    make(chan struct{}),
-		signals: []os.Signal{syscall.SIGINT, syscall.SIGTERM},
+		done:     make(chan struct{}),
+		signals:  []os.Signal{syscall.SIGINT, syscall.SIGTERM},
+		execMode: LIFOSequential,
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
-	// Запускаем слушатель ОС-сигналов
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, c.signals...)
 	go func() {
@@ -38,24 +41,31 @@ func New(opts ...Option) *Closer {
 			c.CloseAll()
 		}
 	}()
+
+	slog.Info(
+		"Closer initialized",
+		slog.String("mode", c.execMode.String()),
+		slog.Duration("timeout", c.timeout),
+	)
+
 	return c
 }
 
-// Add метод экземпляра Closer
+// Add регистрирует одну или несколько функций, которые будут вызваны при завершении.
 func (c *Closer) Add(f ...func() error) {
 	c.mu.Lock()
 	c.funcs = append(c.funcs, f...)
 	c.mu.Unlock()
 }
 
-// Wait метод экземпляра Closer — альтернатива <-c.done
+// Wait блокирует текущую горутину до тех пор,
+// пока не завершится выполнение всех shutdown-функций, либо не пройдет тайм-аут.
 func (c *Closer) Wait() {
 	<-c.done
 }
 
-// CloseAll запускает все функции ровно один раз.
-// После прихода сигнала начинается отсчёт таймаута (если он >0);
-// ждём завершения всех функций или истечения времени.
+// CloseAll запускает все функции ровно один раз
+// и ждёт их выполнения не дольше, чем c.timeout.
 func (c *Closer) CloseAll() {
 	c.once.Do(func() {
 		slog.Info("Graceful shutdown started")
@@ -66,9 +76,6 @@ func (c *Closer) CloseAll() {
 		c.funcs = nil
 		c.mu.Unlock()
 
-		errCh := make(chan error, len(funcs))
-
-		// создаём контекст с таймаутом
 		var ctx context.Context
 		var cancel context.CancelFunc
 		if c.timeout > 0 {
@@ -78,23 +85,56 @@ func (c *Closer) CloseAll() {
 		}
 		defer cancel()
 
-		// запускаем все функции параллельно
-		for _, fn := range funcs {
-			go func(f func() error) {
-				errCh <- f()
-			}(fn)
+		// helper для запуска функции и обработки на случай тайм-аута
+		runWithTimeout := func(fn func() error) error {
+			errCh := make(chan error, 1)
+			go func() { errCh <- fn() }()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case err := <-errCh:
+				return err
+			}
 		}
 
-		// ждём их завершения или таймаута
-		for i := 0; i < cap(errCh); i++ {
-			select {
-			case err := <-errCh:
-				if err != nil {
+		switch c.execMode {
+		case LIFOSequential:
+			for i := len(funcs) - 1; i >= 0; i-- {
+				if err := runWithTimeout(funcs[i]); err != nil {
+					if errors.Is(err, context.DeadlineExceeded) {
+						slog.Error("Graceful shutdown timed out", slog.Duration("timeout", c.timeout))
+						return
+					}
 					slog.Error("Error in shutdown function", slog.Any("error", err))
 				}
-			case <-ctx.Done():
-				slog.Error("Graceful shutdown timed out", slog.Duration("timeout", c.timeout))
-				return
+			}
+
+		case FIFOSequential:
+			for i := 0; i < len(funcs); i++ {
+				if err := runWithTimeout(funcs[i]); err != nil {
+					if errors.Is(err, context.DeadlineExceeded) {
+						slog.Error("Graceful shutdown timed out", slog.Duration("timeout", c.timeout))
+						return
+					}
+					slog.Error("Error in shutdown function", slog.Any("error", err))
+				}
+			}
+
+		case Parallel:
+			errCh := make(chan error, len(funcs))
+			for _, fn := range funcs {
+				go func(f func() error) { errCh <- f() }(fn)
+			}
+			for i := 0; i < cap(errCh); i++ {
+				select {
+				case err := <-errCh:
+					if err != nil {
+						slog.Error("Error in shutdown function", slog.Any("error", err))
+					}
+				case <-ctx.Done():
+					slog.Error("Graceful shutdown timed out", slog.Duration("timeout", c.timeout))
+					return
+				}
 			}
 		}
 

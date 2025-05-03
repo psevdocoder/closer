@@ -14,13 +14,19 @@ const (
 func main() {
 	// Настраиваем сигналы и таймаут для глобального closer
 	closer.Init(
-		closer.WithSignals(syscall.SIGHUP, syscall.SIGINT),
+		closer.WithSignals(syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM),
 		closer.WithTimeout(gracefulShutdownTimeout),
 	)
 
 	closer.Add(func() error {
-		time.Sleep(time.Hour * 5)
-		slog.Info("done sleeping")
+		time.Sleep(time.Second)
+		slog.Info("done sleeping 1")
+		return nil
+	})
+
+	closer.Add(func() error {
+		time.Sleep(time.Second)
+		slog.Info("done sleeping 2")
 		return nil
 	})
 

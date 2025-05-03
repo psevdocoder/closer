@@ -1,3 +1,3 @@
 module git.server.home/pkg/closer
 
-go 1.22
+go 1.24

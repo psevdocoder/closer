@@ -88,7 +88,9 @@ func (c *Closer) CloseAll() {
 		// helper для запуска функции и обработки на случай тайм-аута
 		runWithTimeout := func(fn func() error) error {
 			errCh := make(chan error, 1)
-			go func() { errCh <- fn() }()
+			go func() {
+				errCh <- fn()
+			}()
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -106,6 +108,7 @@ func (c *Closer) CloseAll() {
 						return
 					}
 					slog.Error("Error in shutdown function", slog.Any("error", err))
+					return
 				}
 			}
 

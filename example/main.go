@@ -1,10 +1,11 @@
 package main
 
 import (
-	"git.server.home/pkg/closer"
 	"log/slog"
 	"syscall"
 	"time"
+
+	"git.server.home/pkg/closer/v2"
 )
 
 const (

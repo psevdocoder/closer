@@ -5,7 +5,7 @@ import (
 	"syscall"
 	"time"
 
-	"git.server.home/pkg/closer/v2"
+	"git.server.lan/pkg/closer/v2"
 )
 
 const (

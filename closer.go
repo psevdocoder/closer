@@ -2,7 +2,6 @@ package closer
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -85,16 +84,23 @@ func (c *Closer) CloseAll() {
 		}
 		defer cancel()
 
-		// helper для запуска функции и обработки на случай тайм-аута
-		runWithTimeout := func(fn func() error) error {
+		// helper для запуска функции и обработки тайм-аута
+		runWithContext := func(ctx context.Context, fn func() error) error {
 			errCh := make(chan error, 1)
+
 			go func() {
 				errCh <- fn()
 			}()
+
 			select {
 			case <-ctx.Done():
+				slog.Error("Graceful shutdown timed out", slog.Duration("timeout", c.timeout))
 				return ctx.Err()
+
 			case err := <-errCh:
+				if err != nil {
+					slog.Error("Error in shutdown function", slog.Any("error", err))
+				}
 				return err
 			}
 		}
@@ -102,33 +108,31 @@ func (c *Closer) CloseAll() {
 		switch c.execMode {
 		case LIFOSequential:
 			for i := len(funcs) - 1; i >= 0; i-- {
-				if err := runWithTimeout(funcs[i]); err != nil {
-					if errors.Is(err, context.DeadlineExceeded) {
-						slog.Error("Graceful shutdown timed out", slog.Duration("timeout", c.timeout))
-						return
-					}
-					slog.Error("Error in shutdown function", slog.Any("error", err))
+				if err := runWithContext(ctx, funcs[i]); err != nil {
 					return
 				}
 			}
 
 		case FIFOSequential:
-			for i := 0; i < len(funcs); i++ {
-				if err := runWithTimeout(funcs[i]); err != nil {
-					if errors.Is(err, context.DeadlineExceeded) {
-						slog.Error("Graceful shutdown timed out", slog.Duration("timeout", c.timeout))
-						return
-					}
-					slog.Error("Error in shutdown function", slog.Any("error", err))
+			for _, fn := range funcs {
+				if err := runWithContext(ctx, fn); err != nil {
+					return
 				}
 			}
 
 		case Parallel:
 			errCh := make(chan error, len(funcs))
+
 			for _, fn := range funcs {
-				go func(f func() error) { errCh <- f() }(fn)
+				go func(f func() error) {
+					select {
+					case errCh <- f():
+					case <-ctx.Done():
+					}
+				}(fn)
 			}
-			for i := 0; i < cap(errCh); i++ {
+
+			for i := 0; i < len(funcs); i++ {
 				select {
 				case err := <-errCh:
 					if err != nil {
